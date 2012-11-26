@@ -62,11 +62,11 @@ Spark._patch = function(tgtParent, srcParent, tgtBefore, tgtAfter, preservations
             // match succeeded
             lastTgtMatch = tgt;
             if (tgt.firstChild || src.firstChild) {
-              // Don't patch contents of TEXTAREA tag,
-              // which are only the initial contents but
-              // may affect the tag's .value in IE.
-              if (tgt.nodeName !== "TEXTAREA") {
-                // recurse!
+              if (tgt.nodeName !== "TEXTAREA" && tgt.nodeName !== "SELECT") {
+                // Don't patch contents of TEXTAREA tag (which are only the
+                // initial contents but may affect the tag's .value in IE) or of
+                // SELECT (which is specially handled in _copyAttributes).
+                // Otherwise recurse!
                 Spark._patch(tgt, src, null, null, preservations);
               }
             }
@@ -353,13 +353,7 @@ Spark._Patcher._copyAttributes = function(tgt, src) {
 
   // Determine whether tgt has focus; works in all browsers
   // as of FF3, Safari4
-  var target_focused = (tgt === document.activeElement);
-
-  // Is this a control with a user-mutated "value" property?
-  var has_user_value = (
-    (tgt.nodeName === "INPUT" &&
-     (tgt.type === "text")) ||
-      tgt.nodeName === "TEXTAREA");
+  var targetFocused = (tgt === document.activeElement);
 
   ///// Clear current attributes
 
@@ -405,8 +399,8 @@ Spark._Patcher._copyAttributes = function(tgt, src) {
     // sometimes have a group and sometimes not.
     if (isRadio && name === "name")
       continue;
-    // Never delete the "value" attribute.  It's more effective
-    // to simply overwrite it in the next phase.
+    // Never delete the "value" attribute: we have special three-way diff logic
+    // for it at the end.
     if (name === "value")
       continue;
     // Removing 'src' (e.g. in an iframe) can only be bad.
@@ -444,7 +438,13 @@ Spark._Patcher._copyAttributes = function(tgt, src) {
     // of form controls is sufficiently different in IE from
     // other browsers that we keep the special cases separate.
 
+    // Don't copy _sparkOriginalRenderedValue, though.
+    var srcExpando = src._sparkOriginalRenderedValue;
+    src.removeAttribute('_sparkOriginalRenderedValue');
+
     tgt.mergeAttributes(src);
+    if (srcExpando)
+      src._sparkOriginalRenderedValue = srcExpando;
 
     if (typeof tgt.checked !== "undefined" && src.checked)
       tgt.checked = src.checked;
@@ -483,10 +483,60 @@ Spark._Patcher._copyAttributes = function(tgt, src) {
     }
   }
 
-  // Copy the control's value, only if tgt doesn't have focus.
-  if (has_user_value) {
-    if (! target_focused)
-      tgt.value = src.value;
+  var originalRenderedValue = function (node) {
+    if (!node._sparkOriginalRenderedValue)
+      return null;
+    return node._sparkOriginalRenderedValue[0];
+  };
+  var srcOriginalRenderedValue = originalRenderedValue(src);
+  var tgtOriginalRenderedValue = originalRenderedValue(tgt);
+
+  // Save the target's current value.
+  var tgtCurrentValue = DomUtils.getElementValue(tgt);
+
+  if (tgt.nodeName === "SELECT") {
+    // Copy over the descendents of the tag (eg, OPTIONs, OPTGROUPs, etc) so
+    // that we get the new version's OPTIONs. (We don't look for any more nested
+    // preserved regions inside the element.)
+    while (tgt.firstChild)
+      tgt.removeChild(tgt.firstChild);
+    while (src.firstChild)
+      tgt.insertBefore(src.firstChild, null);
+    // ... but preserve the original <SELECT>'s value if possible (ie, ignore
+    // any <OPTION SELECTED>s that we may have copied over).
+    DomUtils.setElementValue(tgt, tgtCurrentValue);
   }
 
+  // We preserve the old element's value unless both of the following are true:
+  //   - The newly rendered value is different from the old rendered value: ie,
+  //     something has actually changed on the server.
+  //   - It's unfocused. If it's focused, the user might be editing it, and
+  //     we don't want to update what the user is currently editing.
+  //
+  // If we update the element's value, we also update its
+  // _sparkOriginalRenderedValue to match.
+  //
+  // For the special case where the newly rendered value matches the on-screen
+  // value but is different from the old rendered value (eg, the user edited the
+  // field and caused the edit to be written to the server), it doesn't matter
+  // if we preserve the element's value or update it from the (equal) newly
+  // rendered value... but we *DO* need to update _sparkOriginalRenderedValue to
+  // this new value, *even if the element is focused*.
+  //
+  // Note that we expect src._sparkOriginalRenderedValue[0] to be the equal to
+  // src.value. For <LI>'s, though, there is a value property (the ordinal in
+  // the list) even though there is no value attribute (and thus no saved
+  // _sparkOriginalRenderedValue), so we do have to be sure to do the comparison
+  // with src._sparkOriginalRenderedValue[0] rather than with src.value.
+  if (srcOriginalRenderedValue !== tgtOriginalRenderedValue &&
+      (tgtCurrentValue === srcOriginalRenderedValue || !targetFocused)) {
+    // Update the on-screen value to the newly rendered value, but only if it's
+    // an actual change (a seemingly "no-op" value update resets the selection,
+    // so don't do that!)
+    if (tgtCurrentValue !== srcOriginalRenderedValue)
+      DomUtils.setElementValue(tgt, srcOriginalRenderedValue);
+    // ... and overwrite the saved rendered value too, so that the next time
+    // around we'll be comparing to this rendered value instead of the old one.
+    tgt._sparkOriginalRenderedValue = [srcOriginalRenderedValue];
+  }
 };
